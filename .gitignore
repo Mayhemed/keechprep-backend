@@ -1,1 +1,40 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environment
+venv/
+env/
+
+# Debug logs
+app.log
+*.log
+logs/
+openai_debug_*.json
+anthropic_debug_*.json
+
+# Environment files
 .env
+.env.*
+!.env.example
+
+# OS specific files
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.swp
+*~
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+
+# Test files and data
+monthly_time_entries/
+
+# Other
+install_log.txt
