@@ -11,17 +11,31 @@ import logging
 import sys
 from dotenv import load_dotenv
 
+
 # Load environment variables from .env file
 load_dotenv()
 from services.ai_service import (
     generate_keech_declaration, parse_custom_instructions, should_apply_instruction, 
-    ai_redact_timesheet, analyze_discount_entries, llm_client
+    ai_redact_timesheet, analyze_discount_entries, llm_client,
+    review_keech_entries, improve_keech_entries  # Add these new imports
 )
+from services.threaded_ai_service import threaded_redact_timesheet, threaded_batch_review_entries
+from services.evidence_processor import get_evidence_for_period
+import concurrent.futures
+
 from utils.loggers import setup_logger
 
 # Set up logging
 logger = setup_logger()
 logger.info("Starting the application...")
+
+
+# Add this near the start of your app, after imports
+# Create necessary directories
+os.makedirs('case_evidence', exist_ok=True)
+logger.info("Created case_evidence directory")
+
+
 
 # Timesheet processing functions
 def process_timesheet(file_path, period_type='weekly'):
@@ -558,7 +572,7 @@ def upload_timesheet():
 @app.route('/api/analyze', methods=['POST'])
 def analyze_timesheet():
     """
-    Endpoint to analyze the uploaded timesheet
+    Endpoint to analyze the uploaded timesheet with threading for better performance
     """
     logger.info("Received analyze request")
     try:
@@ -569,6 +583,8 @@ def analyze_timesheet():
         ai_provider = data.get('ai_provider')  # Optional AI provider parameter
         ai_model = data.get('ai_model')  # Optional AI model parameter
         selected_period = data.get('selected_period')  # Optional specific period to process
+        use_threading = data.get('use_threading', True)  # New parameter to enable/disable threading
+        max_workers = data.get('max_workers', 5)  # Number of concurrent threads
         
         # Set environment variables for the AI service if provided
         if ai_provider:
@@ -578,7 +594,7 @@ def analyze_timesheet():
             os.environ['AI_MODEL'] = ai_model
             logger.info(f"Setting AI model to: {ai_model}")
         
-        logger.info(f"Analyzing timesheet: {file_path}, period_type: {period_type}")
+        logger.info(f"Analyzing timesheet: {file_path}, period_type: {period_type}, threading: {use_threading}")
         
         if not file_path or not os.path.exists(file_path):
             logger.warning(f"File not found: {file_path}")
@@ -632,14 +648,28 @@ def analyze_timesheet():
         logger.info(f"Task type: {task}")
         
         if task == 'redact':
-            # Create redacted version - pass custom instructions for AI redaction
-            result_data = ai_redact_timesheet(processed_data_for_analysis, custom_instructions)
+            # Choose between threaded or regular redaction based on the use_threading parameter
+            if use_threading:
+                logger.info(f"Using threaded redaction with {max_workers} workers")
+                result_data = threaded_redact_timesheet(
+                    processed_data_for_analysis, 
+                    custom_instructions,
+                    max_workers=max_workers
+                )
+            else:
+                # Use the original non-threaded function
+                result_data = ai_redact_timesheet(processed_data_for_analysis, custom_instructions)
+                
         elif task == 'discount':
-            # Analyze for discounts
+            # For discount task, use the existing method for now
+            # You could implement a threaded version similar to redaction
             result_data = analyze_discount_entries(processed_data_for_analysis, custom_instructions)
         else:
             # Default to redaction
-            result_data = ai_redact_timesheet(processed_data_for_analysis, custom_instructions)
+            if use_threading:
+                result_data = threaded_redact_timesheet(processed_data_for_analysis, custom_instructions)
+            else:
+                result_data = ai_redact_timesheet(processed_data_for_analysis, custom_instructions)
             task = 'redact'
         
         # Get AI model and provider that were used
@@ -724,7 +754,9 @@ def analyze_timesheet():
                 "provider": ai_provider,
                 "model": ai_model,
                 "openai_key_available": bool(llm_client.openai_api_key),
-                "anthropic_key_available": bool(llm_client.anthropic_api_key)
+                "anthropic_key_available": bool(llm_client.anthropic_api_key),
+                "threading_used": use_threading,
+                "max_workers": max_workers if use_threading else 0
             },
             "ai_debug": ai_debug,
             "summary": {
@@ -779,6 +811,444 @@ def analyze_timesheet():
         # Handle other errors
         return jsonify({"error": error_message}), 500
 
+@app.route('/api/upload-case-evidence', methods=['POST'])
+def upload_case_evidence():
+    """
+    Endpoint to upload case evidence document
+    
+    This evidence will be used later for improving time entries
+    """
+    logger.info("Received case evidence upload request")
+    try:
+        logger.info(f"Request files: {request.files}")
+        
+        if 'file' not in request.files:
+            logger.warning("No file part in request")
+            return jsonify({"error": "No file part"}), 400
+        
+        file = request.files['file']
+        logger.info(f"Received file: {file.filename}, {file.content_type}")
+        
+        if file.filename == '':
+            logger.warning("No file selected")
+            return jsonify({"error": "No file selected"}), 400
+        
+        # Create a temporary directory for case evidence if not exists
+        evidence_dir = os.path.join(os.getcwd(), 'case_evidence')
+        os.makedirs(evidence_dir, exist_ok=True)
+        
+        # Save the file with a timestamp to avoid name conflicts
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        safe_filename = re.sub(r'[^\w\-_\.]', '_', file.filename)  # Sanitize filename
+        evidence_filename = f"{timestamp}_{safe_filename}"
+        evidence_path = os.path.join(evidence_dir, evidence_filename)
+        
+        file.save(evidence_path)
+        logger.info(f"Case evidence saved to: {evidence_path}")
+        
+        # Read file content for preview
+        file_content = ""
+        try:
+            with open(evidence_path, 'r', encoding='utf-8') as f:
+                # Read first 1000 characters for preview
+                file_content = f.read(1000)
+                if len(file_content) >= 1000:
+                    file_content += "..."
+        except Exception as e:
+            logger.warning(f"Could not read file content for preview: {str(e)}")
+            file_content = "Content preview not available"
+        
+        return jsonify({
+            "message": "Case evidence uploaded successfully",
+            "file_path": evidence_path,
+            "filename": file.filename,
+            "content_preview": file_content
+        })
+    
+    except Exception as e:
+        logger.error(f"Error uploading case evidence: {str(e)}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/improve-keech-entries', methods=['POST'])
+def improve_keech_entries_api():
+    """
+    Endpoint to improve time entries for a Keech Declaration
+    based on review feedback and case evidence
+    """
+    logger.info("Received Keech improvement request")
+    try:
+        data = request.json
+        file_path = data.get('file_path')
+        period_type = data.get('period_type', 'weekly')
+        selected_period = data.get('selected_period')
+        review_feedback = data.get('review_feedback')
+        evidence_path = data.get('evidence_path')
+        ai_provider = data.get('ai_provider')
+        ai_model = data.get('ai_model')
+        use_threading = data.get('use_threading', True)
+        max_workers = data.get('max_workers', 5)
+        
+        # Set environment variables for the AI service if provided
+        if ai_provider:
+            os.environ['AI_PROVIDER'] = ai_provider
+            logger.info(f"Setting AI provider to: {ai_provider}")
+        if ai_model:
+            os.environ['AI_MODEL'] = ai_model
+            logger.info(f"Setting AI model to: {ai_model}")
+        
+        if not file_path or not os.path.exists(file_path):
+            logger.warning(f"File not found: {file_path}")
+            return jsonify({"error": "File not found"}), 404
+            
+        if not review_feedback:
+            logger.warning("No review feedback provided")
+            return jsonify({"error": "Review feedback is required for improvement"}), 400
+        
+        # Process the timesheet to get the time entries
+        processed_data = process_timesheet(file_path, period_type)
+        
+        # If a specific period was selected, filter the data
+        if selected_period:
+            logger.info(f"Filtering data to only include period: {selected_period}")
+            
+            # Filter detailed_data
+            filtered_detailed_data = [
+                period_data for period_data in processed_data['detailed_data'] 
+                if period_data.get('period') == selected_period
+            ]
+            
+            if not filtered_detailed_data:
+                logger.warning(f"No data found for period: {selected_period}")
+                return jsonify({"error": f"No data found for period: {selected_period}"}), 404
+                
+            # Extract entries from the filtered period
+            time_entries = []
+            for period_data in filtered_detailed_data:
+                time_entries.extend(period_data.get('entries', []))
+        else:
+            # Get all entries from all periods
+            time_entries = []
+            for period_data in processed_data['detailed_data']:
+                time_entries.extend(period_data.get('entries', []))
+        
+        if not time_entries:
+            logger.warning("No time entries found for improvement")
+            return jsonify({"error": "No time entries found for improvement"}), 400
+        
+        # Get period-specific evidence if available
+        filtered_evidence = None
+        if evidence_path and os.path.exists(evidence_path):
+            try:
+                # Filter evidence based on the selected period
+                if selected_period:
+                    filtered_evidence = get_evidence_for_period(evidence_path, selected_period)
+                    logger.info(f"Filtered evidence for period {selected_period}")
+                else:
+                    # Use the full evidence file if no specific period is selected
+                    with open(evidence_path, 'r', encoding='utf-8') as f:
+                        filtered_evidence = f.read()
+                    logger.info(f"Using full evidence (no specific period selected)")
+            except Exception as e:
+                logger.warning(f"Error reading case evidence: {str(e)}")
+                filtered_evidence = None
+        
+        logger.info(f"Improving {len(time_entries)} time entries")
+        
+        # Call the improvement function with threaded option
+        if use_threading and len(time_entries) > 10:
+            from services.threaded_ai_service import ThreadedAIProcessor
+            
+            # Create processor instance
+            processor = ThreadedAIProcessor(max_workers=max_workers)
+            
+            # Define function to process each entry
+            def improve_entry(entry):
+                from services.ai_service_entry import improve_single_entry
+                return improve_single_entry(entry, review_feedback, filtered_evidence)
+            
+            # Process entries in parallel
+            logger.info(f"Using threaded processing with {max_workers} workers")
+            improved_entries = processor.process_entries_in_parallel(
+                time_entries, 
+                improve_entry
+            )
+            
+            # Generate CSV content
+            import pandas as pd
+            from io import StringIO
+            
+            # Convert improved entries to DataFrame and then to CSV
+            df = pd.DataFrame(improved_entries)
+            csv_buffer = StringIO()
+            df.to_csv(csv_buffer, index=False)
+            csv_content = csv_buffer.getvalue()
+            
+            # Generate a summary review
+            improvement_result = {
+                "status": "success",
+                "improved_entries": csv_content,
+                "final_review": f"Successfully improved {len(improved_entries)} entries using parallel processing with {max_workers} workers.",
+                "full_response": f"Threaded processing completed. Improved {len(improved_entries)} entries based on review feedback and evidence."
+            }
+        else:
+            # Use the original non-threaded function
+            improvement_result = improve_keech_entries(time_entries, review_feedback, filtered_evidence)
+        
+        # Get AI model and provider that were used
+        ai_model = os.getenv('AI_MODEL', 'None specified')
+        ai_provider = os.getenv('AI_PROVIDER', 'openai')
+        
+        # Build the response
+        response_data = {
+            "improvement_result": improvement_result,
+            "ai_info": {
+                "provider": ai_provider,
+                "model": ai_model,
+                "openai_key_available": bool(llm_client.openai_api_key),
+                "anthropic_key_available": bool(llm_client.anthropic_api_key),
+                "threading_used": use_threading,
+                "max_workers": max_workers if use_threading else 0
+            },
+            "summary": {
+                "total_entries": len(time_entries),
+                "period_type": period_type,
+                "selected_period": selected_period,
+                "case_evidence_used": filtered_evidence is not None,
+                "evidence_length": len(filtered_evidence) if filtered_evidence else 0
+            }
+        }
+        
+        logger.info("Keech improvement completed successfully")
+        return jsonify(response_data)
+    
+    except Exception as e:
+        logger.error(f"Error improving Keech entries: {str(e)}")
+        import traceback
+        logger.error(traceback.format_exc())
+        
+        # Handle timeout errors specially
+        error_message = str(e)
+        if "timed out" in error_message.lower():
+            return jsonify({
+                "error": "The AI service timed out. This usually means the model is too busy or the input is too complex. Please try a different AI model or try again later.",
+                "error_details": error_message,
+                "error_type": "timeout"
+            }), 504  # Gateway Timeout status code
+        
+        return jsonify({"error": str(e)}), 500
+
+# Add a new route to process multiple periods at once
+@app.route('/api/process-multiple-periods', methods=['POST'])
+def process_multiple_periods():
+    """
+    Endpoint to process multiple periods in parallel
+    """
+    logger.info("Received multi-period processing request")
+    try:
+        data = request.json
+        file_path = data.get('file_path')
+        period_type = data.get('period_type', 'weekly')
+        periods = data.get('periods', [])  # List of periods to process
+        custom_instructions = data.get('custom_instructions', '')
+        evidence_path = data.get('evidence_path')
+        ai_provider = data.get('ai_provider')
+        ai_model = data.get('ai_model')
+        max_workers = data.get('max_workers', 3)  # Default to 3 for parallel period processing
+        
+        # Set environment variables for the AI service if provided
+        if ai_provider:
+            os.environ['AI_PROVIDER'] = ai_provider
+            logger.info(f"Setting AI provider to: {ai_provider}")
+        if ai_model:
+            os.environ['AI_MODEL'] = ai_model
+            logger.info(f"Setting AI model to: {ai_model}")
+        
+        if not file_path or not os.path.exists(file_path):
+            logger.warning(f"File not found: {file_path}")
+            return jsonify({"error": "File not found"}), 404
+            
+        if not periods:
+            logger.warning("No periods provided")
+            return jsonify({"error": "No periods provided for processing"}), 400
+        
+        # Process a single period
+        def process_period(period):
+            try:
+                logger.info(f"Processing period: {period}")
+                
+                # Step 1: Review the entries for this period
+                review_response = review_keech_entries_for_period(
+                    file_path=file_path,
+                    period_type=period_type,
+                    selected_period=period,
+                    custom_instructions=custom_instructions,
+                    ai_provider=ai_provider,
+                    ai_model=ai_model,
+                    use_threading=True  # Always use threading for the review step
+                )
+                
+                if not review_response or not review_response.get('full_response'):
+                    raise Exception(f"Failed to review period {period}")
+                
+                # Step 2: Get period-specific evidence
+                filtered_evidence = None
+                if evidence_path and os.path.exists(evidence_path):
+                    filtered_evidence = get_evidence_for_period(evidence_path, period)
+                
+                # Step 3: Improve the entries based on the review
+                time_entries = get_entries_for_period(file_path, period_type, period)
+                
+                improvement_result = improve_keech_entries(
+                    time_entries, 
+                    review_response.get('full_response'),
+                    filtered_evidence
+                )
+                
+                return {
+                    "period": period,
+                    "review": review_response,
+                    "improvements": improvement_result,
+                    "status": "success"
+                }
+            except Exception as e:
+                logger.error(f"Error processing period {period}: {str(e)}")
+                return {
+                    "period": period,
+                    "error": str(e),
+                    "status": "error"
+                }
+        
+        # Process periods in parallel
+        results = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Submit tasks for each period
+            future_to_period = {executor.submit(process_period, period): period for period in periods}
+            
+            # Process results as they complete
+            for future in concurrent.futures.as_completed(future_to_period):
+                period = future_to_period[future]
+                try:
+                    result = future.result()
+                    results.append(result)
+                    logger.info(f"Completed processing for period {period}")
+                except Exception as e:
+                    logger.error(f"Error in future for period {period}: {str(e)}")
+                    results.append({
+                        "period": period,
+                        "error": str(e),
+                        "status": "error"
+                    })
+        
+        # Sort results by period for consistency
+        results.sort(key=lambda x: x.get('period', ''))
+        
+        # Build the response
+        response_data = {
+            "results": results,
+            "summary": {
+                "total_periods": len(periods),
+                "successful_periods": sum(1 for r in results if r.get('status') == 'success'),
+                "failed_periods": sum(1 for r in results if r.get('status') == 'error'),
+                "period_type": period_type
+            },
+            "ai_info": {
+                "provider": ai_provider,
+                "model": ai_model,
+                "max_workers": max_workers
+            }
+        }
+        
+        logger.info(f"Multi-period processing completed. Processed {len(periods)} periods.")
+        return jsonify(response_data)
+        
+    except Exception as e:
+        logger.error(f"Error in multi-period processing: {str(e)}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return jsonify({"error": str(e)}), 500
+
+# Helper function to get entries for a specific period
+def get_entries_for_period(file_path, period_type, selected_period):
+    """Get time entries for a specific period"""
+    processed_data = process_timesheet(file_path, period_type)
+    
+    # Filter to the specified period
+    filtered_data = [
+        period_data for period_data in processed_data['detailed_data'] 
+        if period_data.get('period') == selected_period
+    ]
+    
+    # Extract entries
+    entries = []
+    for period_data in filtered_data:
+        entries.extend(period_data.get('entries', []))
+    
+    return entries
+
+# Helper function to review entries for a specific period
+def review_keech_entries_for_period(
+    file_path, period_type, selected_period, 
+    custom_instructions, ai_provider, ai_model, 
+    use_threading=True
+):
+    """Review time entries for a specific period"""
+    # Get entries for the period
+    entries = get_entries_for_period(file_path, period_type, selected_period)
+    
+    if not entries:
+        return {"status": "error", "error": f"No entries found for period {selected_period}"}
+    
+    # Call the appropriate review function
+    if use_threading and len(entries) > 10:
+        from services.threaded_ai_service import threaded_batch_review_entries
+        return threaded_batch_review_entries(
+            entries, 
+            custom_instructions,
+            max_workers=5,
+            batch_size=20
+        )
+    else:
+        from services.ai_service import review_keech_entries
+        return review_keech_entries(entries, custom_instructions)
+        
+@app.route('/api/download-improved-keech-entries', methods=['POST'])
+def download_improved_keech_entries():
+    """
+    Endpoint to download improved Keech entries as a CSV file
+    """
+    logger.info("Received download improved Keech entries request")
+    try:
+        data = request.json
+        csv_content = data.get('csv_content')
+        
+        if not csv_content:
+            logger.warning("No CSV content provided")
+            return jsonify({"error": "No CSV content provided"}), 400
+        
+        # Create temporary file with the CSV content
+        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.csv')
+        
+        # Write the CSV content directly to the file
+        with open(temp_file.name, 'w', encoding='utf-8') as f:
+            f.write(csv_content)
+        
+        filename = "improved_keech_entries.csv"
+        
+        logger.info(f"Prepared download file: {filename}")
+        return send_file(
+            temp_file.name,
+            as_attachment=True,
+            download_name=filename,
+            mimetype='text/csv'
+        )
+    except Exception as e:
+        logger.error(f"Error downloading improved Keech entries: {str(e)}")
+        import traceback
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        return jsonify({"error": str(e)}), 500
+        
 @app.route('/api/download/<file_type>', methods=['POST'])
 def download_file(file_type):
     """
@@ -1233,6 +1703,124 @@ def analyze_with_ai():
         logger.error(f"Error during AI analysis: {str(e)}")
         import traceback
         logger.error(traceback.format_exc())
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/review-keech-entries', methods=['POST'])
+def review_keech_entries_api():
+    """
+    Endpoint to review time entries for a Keech Declaration using threading
+    """
+    logger.info("Received Keech review request")
+    try:
+        data = request.json
+        file_path = data.get('file_path')
+        period_type = data.get('period_type', 'weekly')
+        selected_period = data.get('selected_period')
+        custom_instructions = data.get('custom_instructions', '')
+        ai_provider = data.get('ai_provider')
+        ai_model = data.get('ai_model')
+        use_threading = data.get('use_threading', True)  # New parameter to enable/disable threading
+        max_workers = data.get('max_workers', 3)  # Number of concurrent threads
+        batch_size = data.get('batch_size', 20)  # Entries per batch for batch processing
+        
+        # Set environment variables for the AI service if provided
+        if ai_provider:
+            os.environ['AI_PROVIDER'] = ai_provider
+            logger.info(f"Setting AI provider to: {ai_provider}")
+        if ai_model:
+            os.environ['AI_MODEL'] = ai_model
+            logger.info(f"Setting AI model to: {ai_model}")
+        
+        if not file_path or not os.path.exists(file_path):
+            logger.warning(f"File not found: {file_path}")
+            return jsonify({"error": "File not found"}), 404
+            
+        # Process the timesheet to get the time entries
+        processed_data = process_timesheet(file_path, period_type)
+        
+        # If a specific period was selected, filter the data
+        if selected_period:
+            logger.info(f"Filtering data to only include period: {selected_period}")
+            
+            # Filter detailed_data
+            filtered_detailed_data = [
+                period_data for period_data in processed_data['detailed_data'] 
+                if period_data.get('period') == selected_period
+            ]
+            
+            if not filtered_detailed_data:
+                logger.warning(f"No data found for period: {selected_period}")
+                return jsonify({"error": f"No data found for period: {selected_period}"}), 404
+                
+            # Extract entries from the filtered period
+            time_entries = []
+            for period_data in filtered_detailed_data:
+                time_entries.extend(period_data.get('entries', []))
+        else:
+            # Get all entries from all periods
+            time_entries = []
+            for period_data in processed_data['detailed_data']:
+                time_entries.extend(period_data.get('entries', []))
+        
+        if not time_entries:
+            logger.warning("No time entries found for review")
+            return jsonify({"error": "No time entries found for review"}), 400
+            
+        logger.info(f"Reviewing {len(time_entries)} time entries")
+        
+        # Call the appropriate review function based on threading preference
+        if use_threading and len(time_entries) > batch_size:
+            logger.info(f"Using threaded batch review with {max_workers} workers and batch size {batch_size}")
+            review_result = threaded_batch_review_entries(
+                time_entries, 
+                custom_instructions,
+                max_workers=max_workers,
+                batch_size=batch_size
+            )
+        else:
+            # Use the original non-threaded function
+            review_result = review_keech_entries(time_entries, custom_instructions)
+        
+        # Get AI model and provider that were used
+        ai_model = os.getenv('AI_MODEL', 'None specified')
+        ai_provider = os.getenv('AI_PROVIDER', 'openai')
+        
+        # Build the response
+        response_data = {
+            "review_result": review_result,
+            "ai_info": {
+                "provider": ai_provider,
+                "model": ai_model,
+                "openai_key_available": bool(llm_client.openai_api_key),
+                "anthropic_key_available": bool(llm_client.anthropic_api_key),
+                "threading_used": use_threading,
+                "max_workers": max_workers if use_threading else 0,
+                "batch_size": batch_size if use_threading else 0
+            },
+            "summary": {
+                "total_entries": len(time_entries),
+                "period_type": period_type,
+                "selected_period": selected_period
+            }
+        }
+        
+        logger.info("Keech review completed successfully")
+        return jsonify(response_data)
+    
+    except Exception as e:
+        logger.error(f"Error reviewing Keech entries: {str(e)}")
+        import traceback
+        logger.error(traceback.format_exc())
+        
+        # Handle timeout errors specially
+        error_message = str(e)
+        if "timed out" in error_message.lower():
+            return jsonify({
+                "error": "The AI service timed out. This usually means the model is too busy or the input is too complex. Please try a different AI model or try again later.",
+                "error_details": error_message,
+                "error_type": "timeout"
+            }), 504  # Gateway Timeout status code
+        
         return jsonify({"error": str(e)}), 500
 
 if __name__ == '__main__':
